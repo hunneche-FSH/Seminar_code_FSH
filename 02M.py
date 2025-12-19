@@ -7,21 +7,7 @@ from sklearn.metrics import mean_squared_error
 # 1. Load Data
 file_path = r"C:\Users\hunne\OneDrive - University of Copenhagen\9. Semester\Seminar financial economtri\ML_ready.xlsx"
 
-try:
-    df = pd.read_excel(file_path)
-except FileNotFoundError:
-    print("File not found. Generating dummy data for demonstration...")
-    dates = pd.date_range(start='2020-01-01', periods=1000)
-    # Generate enough columns to ensure index 58 exists
-    data = {
-        'Date': dates,
-        'Target': np.sin(np.linspace(0, 100, 1000)) + np.random.normal(0, 0.1, 1000)
-    }
-    for i in range(2, 65): # Create columns up to index 64
-        data[f'Col_{i}'] = np.random.rand(1000) * 0.1 # Small random noise
-        
-    df = pd.DataFrame(data)
-    print("Dummy data generated with 65 columns.")
+
 
 # 2. Select Target and "Naive" Prediction
 # Target is usually Column 2 (index 1)

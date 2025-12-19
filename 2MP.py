@@ -3,14 +3,55 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import copy 
-import math # Still useful for Positional Encoding, though now unused.
+import math
+import random
 
-# --- 1. SETUP DEVICE ---
+# ==========================================
+# --- USER CONFIGURATION (HYPERPARAMETERS) ---
+# ==========================================
+# 1. Data
+FILE_PATH = r"C:\Users\hunne\Desktop\Seminar kode\ML_ready_LSTM.xlsx"
+TEST_SPLIT_PCT = 0.1  # 10% for testing
+VAL_SPLIT_PCT = 0.1   # 10% for validation
+SEQUENCE_LENGTH = 30  # Look back 30 time steps
+
+# 2. Model Architecture
+MODEL_NAME = "LSTM Model"
+LSTM_HIDDEN_DIM = 64  # Hidden neurons in LSTM layers
+NUM_LSTM_LAYERS = 2   # Number of stacked LSTM layers
+DROPOUT_RATE = 0.2
+
+# 3. Training Settings
+BATCH_SIZE = 64
+LEARNING_RATE = 0.001
+EPOCHS = 200
+PATIENCE = 50           # Early stopping patience
+FACTOR = 0.5            # Learning rate reduction factor
+MIN_LR = 1e-5           # Minimum learning rate
+N_VIEW = 100            # How many days to zoom in on graphs
+SEED = 42               # Reproducibility Seed
+
+# ==========================================
+# --- 1. SETUP DEVICE & SEED ---
+# ==========================================
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_seed(SEED)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("-" * 30)
 print(f"Running on: {device}")
@@ -19,25 +60,43 @@ if device.type == 'cuda':
 print("-" * 30)
 
 # --- 2. LOAD DATA ---
-file_path = r"C:\Users\hunne\Desktop\Seminar kode\ML_ready_LSTM.xlsx"
-df = pd.read_excel(file_path)
+df = pd.read_excel(FILE_PATH)
 
-# --- 3. PREPROCESSING ---
+# --- 3. PREPROCESSING (LEAKAGE FIX) ---
+# Separate Target and Features
 y = df.iloc[:, 1].values.reshape(-1, 1) 
 X_raw = df.iloc[:, 2:].values
 
-# Scaling
+# A. Calculate Split Indices on RAW Data
+n = len(df)
+test_len = int(n * TEST_SPLIT_PCT)
+val_len = int(n * VAL_SPLIT_PCT)
+train_end = n - val_len - test_len
+val_end = n - test_len
+
+# B. Split Raw Data FIRST
+X_train_raw = X_raw[:train_end]
+y_train_raw = y[:train_end]
+
+X_val_raw = X_raw[train_end:val_end]
+y_val_raw = y[train_end:val_end]
+
+X_test_raw = X_raw[val_end:]
+y_test_raw = y[val_end:]
+
+# C. Scaling: Fit ONLY on Train, Transform others
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_raw)
+X_train_scaled = scaler.fit_transform(X_train_raw)
+X_val_scaled = scaler.transform(X_val_raw)
+X_test_scaled = scaler.transform(X_test_raw)
 
 # --- SEQUENCE CREATION FOR LSTM ---
-# LSTMs also require input shape: (Batch_Size, Sequence_Length, Features)
-# We keep the sliding window approach.
-SEQUENCE_LENGTH = 30  # Look back 30 time steps to predict the next one
-
 def create_sequences(input_data, target_data, seq_length):
     xs, ys = [], []
-    # Loop needs to stop before the end to ensure we have a full sequence plus a target
+    # Loop needs to ensure we have enough data for a sequence
+    if len(input_data) <= seq_length:
+        return np.array([]), np.array([])
+        
     for i in range(len(input_data) - seq_length):
         x = input_data[i:(i + seq_length)]
         y = target_data[i + seq_length]
@@ -45,37 +104,25 @@ def create_sequences(input_data, target_data, seq_length):
         ys.append(y)
     return np.array(xs), np.array(ys)
 
-# Create sequences from the full dataset
-X_seq, y_seq = create_sequences(X_scaled, y, SEQUENCE_LENGTH)
+# D. Create sequences for each split INDEPENDENTLY
+X_train_np, y_train_np = create_sequences(X_train_scaled, y_train_raw, SEQUENCE_LENGTH)
+X_val_np, y_val_np = create_sequences(X_val_scaled, y_val_raw, SEQUENCE_LENGTH)
+X_test_np, y_test_np = create_sequences(X_test_scaled, y_test_raw, SEQUENCE_LENGTH)
 
-# Splitting (Uses the sequence-adjusted data)
-n = len(X_seq)
-train_end = int(n * 0.8)
-val_end = int(n * 0.9)
-
-X_train_np = X_seq[:train_end]
-y_train_np = y_seq[:train_end]
-X_val_np = X_seq[train_end:val_end]
-y_val_np = y_seq[train_end:val_end]
-X_test_np = X_seq[val_end:]
-y_test_np = y_seq[val_end:]
-
-# Convert to Tensors and move to GPU
+# E. Convert to Tensors and move to GPU
 X_train = torch.tensor(X_train_np, dtype=torch.float32).to(device)
 y_train = torch.tensor(y_train_np, dtype=torch.float32).to(device)
 X_val = torch.tensor(X_val_np, dtype=torch.float32).to(device)
 y_val = torch.tensor(y_val_np, dtype=torch.float32).to(device)
 X_test = torch.tensor(X_test_np, dtype=torch.float32).to(device)
-y_test = torch.tensor(y_test_np, dtype=torch.float32).to(device) # Keep y_test as tensor for loss calculation
+y_test = torch.tensor(y_test_np, dtype=torch.float32).to(device)
 
 # DataLoader
 train_dataset = TensorDataset(X_train, y_train)
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # Feature dimension is the last dimension of the input
 input_dim = X_train.shape[2] 
-LSTM_HIDDEN_DIM = 64 # Size of the feature space after LSTM processing
-NUM_LSTM_LAYERS = 2
 
 print(f"Data Split Summary:")
 print(f"Sequence Length: {SEQUENCE_LENGTH}")
@@ -85,67 +132,53 @@ print("-" * 30)
 
 # --- 4. BUILD LSTM MODEL ---
 class LSTMPredictor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers):
+    def __init__(self, input_dim, hidden_dim, num_layers, dropout):
         super(LSTMPredictor, self).__init__()
         
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        # LSTM layer expects input: (batch_size, sequence_length, input_dim)
-        # batch_first=True is set by default in recent PyTorch versions, but explicitly set for clarity.
         self.lstm = nn.LSTM(
             input_size=input_dim, 
             hidden_size=hidden_dim, 
             num_layers=num_layers, 
             batch_first=True,
-            dropout=0.2 # Dropout between layers
+            dropout=dropout
         )
         
-        # The output from the final LSTM step is connected to a Linear layer
         self.linear = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        # x shape: [batch_size, sequence_length, input_dim]
-        
-        # Initialize hidden state and cell state (optional, defaults to zeros if not passed)
-        # h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
-        # c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
-        
-        # out shape: [batch_size, sequence_length, hidden_dim]
-        # hn, cn are the final hidden/cell states, typically ignored for sequence-to-one prediction
+        # out: [batch_size, sequence_length, hidden_dim]
         out, (hn, cn) = self.lstm(x)
         
-        # We only care about the output from the last time step for a single prediction.
-        # out[:, -1, :] slices the output for the last element in the sequence dimension
+        # Take the last time step
         out = self.linear(out[:, -1, :]) 
         return out
 
-# Initialize Model
 model = LSTMPredictor(
     input_dim=input_dim, 
     hidden_dim=LSTM_HIDDEN_DIM, 
-    num_layers=NUM_LSTM_LAYERS
+    num_layers=NUM_LSTM_LAYERS,
+    dropout=DROPOUT_RATE
 ).to(device)
 
 # --- 5. COMPILE ---
 criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-# Scheduler
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-5
+    optimizer, mode='min', factor=FACTOR, patience=10, min_lr=MIN_LR
 )
 
 # --- 6. TRAINING LOOP ---
-patience = 100
 best_val_loss = float('inf')
 patience_counter = 0
 best_model_weights = None
 
 history = {'loss': [], 'val_loss': []}
 
-epochs = 200 
-for epoch in range(epochs):
+for epoch in range(EPOCHS):
     # Training
     model.train()
     running_loss = 0.0
@@ -178,12 +211,12 @@ for epoch in range(epochs):
         patience_counter = 0 
     else:
         patience_counter += 1
-        if patience_counter >= patience:
+        if patience_counter >= PATIENCE:
             print(f"Early stopping at epoch {epoch+1}")
             break
 
     if (epoch + 1) % 10 == 0:
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss:.6f} - Val Loss: {val_loss_val:.6f}")
+        print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {epoch_loss:.6f} - Val Loss: {val_loss_val:.6f}")
 
 if best_model_weights:
     model.load_state_dict(best_model_weights)
@@ -192,16 +225,67 @@ if best_model_weights:
 # --- 7. PREDICTIONS ---
 model.eval()
 with torch.no_grad():
-    # Predictions are still based on the reshaped, sequenced data
     pred_train = model(X_train).cpu().numpy().flatten()
     pred_val = model(X_val).cpu().numpy().flatten()
+    # PRED TEST IS CALCULATED HERE - ONLY USED FOR FINAL METRICS
     pred_test = model(X_test).cpu().numpy().flatten()
 
 y_train_plot = y_train_np.flatten()
 y_val_plot = y_val_np.flatten()
 y_test_plot = y_test_np.flatten()
 
-# --- 8. VISUALIZATION ---
+# --- 8. PERFORMANCE EVALUATION TABLE (STRICTLY TEST DATA) ---
+print("\n" + "="*50)
+print("FINAL MODEL EVALUATION (TEST DATA ONLY)")
+print("="*50)
+
+# A. Standard Metrics
+mse_score = mean_squared_error(y_test_plot, pred_test)
+mae_score = mean_absolute_error(y_test_plot, pred_test)
+r2_score_val = r2_score(y_test_plot, pred_test)
+
+# B. Directional Accuracy (DA) Logic
+actual_signs = np.sign(y_test_plot)
+pred_signs = np.sign(pred_test)
+
+# Total DA
+correct_directions = (actual_signs == pred_signs)
+da_total = np.mean(correct_directions)
+
+# Positive DA
+pos_mask = y_test_plot > 0
+if np.sum(pos_mask) > 0:
+    da_pos = np.mean(correct_directions[pos_mask])
+else:
+    da_pos = np.nan
+
+# Negative DA
+neg_mask = y_test_plot < 0
+if np.sum(neg_mask) > 0:
+    da_neg = np.mean(correct_directions[neg_mask])
+else:
+    da_neg = np.nan
+
+# C. Create Table
+results_data = {
+    "Model": [MODEL_NAME],
+    "Layers": [NUM_LSTM_LAYERS], 
+    "Neurons": [f"{input_dim} -> LSTM({LSTM_HIDDEN_DIM}) -> 1"], 
+    "MSE": [f"{mse_score:.5f}"],
+    "MAE": [f"{mae_score:.5f}"],
+    "R^2": [f"{r2_score_val:.4f}"],
+    "DA Total": [f"{da_total:.2%}"],
+    "DA Pos": [f"{da_pos:.2%}"],
+    "DA Neg": [f"{da_neg:.2%}"]
+}
+
+results_df = pd.DataFrame(results_data)
+
+# Display the table
+print(results_df.to_string(index=False))
+print("="*50 + "\n")
+
+# --- 9. VISUALIZATION ---
 sns.set_style("whitegrid")
 fig = plt.figure(figsize=(18, 18))
 gs = fig.add_gridspec(3, 2)
@@ -226,8 +310,6 @@ if len(y_test_plot) > 0 and len(pred_test) > 0:
 ax2.set_title('2. Prediction Accuracy (Actual vs Predicted)')
 ax2.set_xlabel('Actual Returns')
 ax2.set_ylabel('Predicted Returns')
-
-N_VIEW = 100 
 
 # Graph 3
 ax3 = fig.add_subplot(gs[1, 0])

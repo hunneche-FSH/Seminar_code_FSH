@@ -3,14 +3,56 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import copy 
 import math
+import random
 
-# --- 1. SETUP DEVICE ---
+# ==========================================
+# --- USER CONFIGURATION (HYPERPARAMETERS) ---
+# ==========================================
+# 1. Data
+FILE_PATH = r"C:\Users\hunne\Desktop\Seminar kode\ML_ready_LSTM.xlsx"
+TEST_SPLIT_PCT = 0.1
+VAL_SPLIT_PCT = 0.1
+SEQUENCE_LENGTH = 30 
+
+# 2. Model Architecture
+MODEL_NAME = "Transformer (Time Series)"
+D_MODEL = 72            # Transformer model dimension
+N_HEAD = 12             # Number of attention heads
+NUM_LAYERS = 3          # Number of encoder layers
+DROPOUT_RATE = 0.2
+
+# 3. Training Settings
+BATCH_SIZE = 64
+LEARNING_RATE = 0.001
+EPOCHS = 50
+PATIENCE = 50           # Early stopping patience
+FACTOR = 0.1            # Learning rate reduction factor
+MIN_LR = 1e-5
+N_VIEW = 100            # How many days to zoom in on graphs
+SEED = 42               # Reproducibility Seed
+
+# ==========================================
+# --- 1. SETUP DEVICE & SEED ---
+# ==========================================
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_seed(SEED)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("-" * 30)
 print(f"Running on: {device}")
@@ -19,29 +61,49 @@ if device.type == 'cuda':
 print("-" * 30)
 
 # --- 2. LOAD DATA ---
-# Ensure this path is correct for your machine
-file_path = r"C:\Users\hunne\Desktop\Seminar kode\ML_ready_LSTM.xlsx"
-df = pd.read_excel(file_path)
+df = pd.read_excel(FILE_PATH)
 
-# --- 3. PREPROCESSING ---
+# --- 3. PREPROCESSING (LEAKAGE FIX) ---
 # Target (Returns)
 y = df.iloc[:, 1].values.reshape(-1, 1) 
 # Features
 X_raw = df.iloc[:, 2:].values
 
-# 1. Scale Features
-scaler_x = StandardScaler()
-X_scaled = scaler_x.fit_transform(X_raw)
+# A. Calculate Split Indices on RAW Data
+n = len(df)
+test_len = int(n * TEST_SPLIT_PCT)
+val_len = int(n * VAL_SPLIT_PCT)
+train_end = n - val_len - test_len
+val_end = n - test_len
 
-# 2. Scale Target (CRITICAL FIX)
+# B. Split Raw Data FIRST
+X_train_raw = X_raw[:train_end]
+y_train_raw = y[:train_end]
+
+X_val_raw = X_raw[train_end:val_end]
+y_val_raw = y[train_end:val_end]
+
+X_test_raw = X_raw[val_end:]
+y_test_raw = y[val_end:]
+
+# C. Scale Features (Fit only on Train)
+scaler_x = StandardScaler()
+X_train_scaled = scaler_x.fit_transform(X_train_raw)
+X_val_scaled = scaler_x.transform(X_val_raw)
+X_test_scaled = scaler_x.transform(X_test_raw)
+
+# D. Scale Target (Fit only on Train)
 scaler_y = StandardScaler()
-y_scaled = scaler_y.fit_transform(y)
+y_train_scaled = scaler_y.fit_transform(y_train_raw)
+y_val_scaled = scaler_y.transform(y_val_raw)
+y_test_scaled = scaler_y.transform(y_test_raw)
 
 # --- SEQUENCE CREATION ---
-SEQUENCE_LENGTH = 30  # Look back 30 time steps
-
 def create_sequences(input_data, target_data, seq_length):
     xs, ys = [], []
+    if len(input_data) <= seq_length:
+        return np.array([]), np.array([])
+        
     for i in range(len(input_data) - seq_length):
         x = input_data[i:(i + seq_length)]
         y = target_data[i + seq_length]
@@ -49,31 +111,22 @@ def create_sequences(input_data, target_data, seq_length):
         ys.append(y)
     return np.array(xs), np.array(ys)
 
-# Use y_scaled here!
-X_seq, y_seq = create_sequences(X_scaled, y_scaled, SEQUENCE_LENGTH)
+# E. Create Sequences Independently
+X_train_np, y_train_np = create_sequences(X_train_scaled, y_train_scaled, SEQUENCE_LENGTH)
+X_val_np, y_val_np = create_sequences(X_val_scaled, y_val_scaled, SEQUENCE_LENGTH)
+X_test_np, y_test_np = create_sequences(X_test_scaled, y_test_scaled, SEQUENCE_LENGTH)
 
-# Splitting
-n = len(X_seq)
-train_end = int(n * 0.8)
-val_end = int(n * 0.9)
-
-X_train_np = X_seq[:train_end]
-y_train_np = y_seq[:train_end]
-X_val_np = X_seq[train_end:val_end]
-y_val_np = y_seq[train_end:val_end]
-X_test_np = X_seq[val_end:]
-y_test_np = y_seq[val_end:]
-
-# Convert to Tensors and move to GPU
+# F. Convert to Tensors and move to GPU
 X_train = torch.tensor(X_train_np, dtype=torch.float32).to(device)
 y_train = torch.tensor(y_train_np, dtype=torch.float32).to(device)
 X_val = torch.tensor(X_val_np, dtype=torch.float32).to(device)
 y_val = torch.tensor(y_val_np, dtype=torch.float32).to(device)
 X_test = torch.tensor(X_test_np, dtype=torch.float32).to(device)
+y_test = torch.tensor(y_test_np, dtype=torch.float32).to(device)
 
 # DataLoader
 train_dataset = TensorDataset(X_train, y_train)
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 input_dim = X_train.shape[2] 
 
@@ -100,7 +153,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1), :]
 
 class TimeSeriesTransformer(nn.Module):
-    def __init__(self, input_dim, d_model=72, nhead=12, num_layers=3, dropout=0.2):
+    def __init__(self, input_dim, d_model, nhead, num_layers, dropout):
         super(TimeSeriesTransformer, self).__init__()
         
         self.input_linear = nn.Linear(input_dim, d_model)
@@ -117,27 +170,31 @@ class TimeSeriesTransformer(nn.Module):
         prediction = self.output_linear(last_time_step)
         return prediction
 
-model = TimeSeriesTransformer(input_dim=input_dim).to(device)
+model = TimeSeriesTransformer(
+    input_dim=input_dim,
+    d_model=D_MODEL,
+    nhead=N_HEAD,
+    num_layers=NUM_LAYERS,
+    dropout=DROPOUT_RATE
+).to(device)
 
 # --- 5. COMPILE ---
 criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # Scheduler
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='min', factor=0.1, patience=50, min_lr=1e-5
+    optimizer, mode='min', factor=FACTOR, patience=PATIENCE, min_lr=MIN_LR
 )
 
 # --- 6. TRAINING LOOP ---
-patience = 200 
 best_val_loss = float('inf')
 patience_counter = 0
 best_model_weights = None
 
 history = {'loss': [], 'val_loss': []}
 
-epochs = 100 
-for epoch in range(epochs):
+for epoch in range(EPOCHS):
     # Training
     model.train()
     running_loss = 0.0
@@ -170,18 +227,18 @@ for epoch in range(epochs):
         patience_counter = 0 
     else:
         patience_counter += 1
-        if patience_counter >= patience:
+        if patience_counter >= PATIENCE:
             print(f"Early stopping at epoch {epoch+1}")
             break
 
     if (epoch + 1) % 10 == 0:
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss:.6f} - Val Loss: {val_loss_val:.6f}")
+        print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {epoch_loss:.6f} - Val Loss: {val_loss_val:.6f}")
 
 if best_model_weights:
     model.load_state_dict(best_model_weights)
     print("Restored best model weights.")
 
-# --- 7. PREDICTIONS (FIXED) ---
+# --- 7. PREDICTIONS ---
 model.eval()
 with torch.no_grad():
     # Get raw scaled predictions from GPU
@@ -199,7 +256,58 @@ y_train_plot = scaler_y.inverse_transform(y_train_np).flatten()
 y_val_plot = scaler_y.inverse_transform(y_val_np).flatten()
 y_test_plot = scaler_y.inverse_transform(y_test_np).flatten()
 
-# --- 8. VISUALIZATION ---
+# --- 8. PERFORMANCE EVALUATION TABLE (STRICTLY TEST DATA) ---
+print("\n" + "="*50)
+print("FINAL MODEL EVALUATION (TEST DATA ONLY)")
+print("="*50)
+
+# A. Standard Metrics
+mse_score = mean_squared_error(y_test_plot, pred_test)
+mae_score = mean_absolute_error(y_test_plot, pred_test)
+r2_score_val = r2_score(y_test_plot, pred_test)
+
+# B. Directional Accuracy (DA) Logic
+actual_signs = np.sign(y_test_plot)
+pred_signs = np.sign(pred_test)
+
+# Total DA
+correct_directions = (actual_signs == pred_signs)
+da_total = np.mean(correct_directions)
+
+# Positive DA
+pos_mask = y_test_plot > 0
+if np.sum(pos_mask) > 0:
+    da_pos = np.mean(correct_directions[pos_mask])
+else:
+    da_pos = np.nan
+
+# Negative DA
+neg_mask = y_test_plot < 0
+if np.sum(neg_mask) > 0:
+    da_neg = np.mean(correct_directions[neg_mask])
+else:
+    da_neg = np.nan
+
+# C. Create Table
+results_data = {
+    "Model": [MODEL_NAME],
+    "Layers": [NUM_LAYERS], 
+    "Neurons": [f"{D_MODEL} dim / {N_HEAD} heads"], 
+    "MSE": [f"{mse_score:.5f}"],
+    "MAE": [f"{mae_score:.5f}"],
+    "R^2": [f"{r2_score_val:.4f}"],
+    "DA Total": [f"{da_total:.2%}"],
+    "DA Pos": [f"{da_pos:.2%}"],
+    "DA Neg": [f"{da_neg:.2%}"]
+}
+
+results_df = pd.DataFrame(results_data)
+
+# Display the table
+print(results_df.to_string(index=False))
+print("="*50 + "\n")
+
+# --- 9. VISUALIZATION ---
 sns.set_style("whitegrid")
 fig = plt.figure(figsize=(18, 18))
 gs = fig.add_gridspec(3, 2)
@@ -223,8 +331,6 @@ if len(y_test_plot) > 0:
 ax2.set_title('2. Prediction Accuracy (Actual vs Predicted)')
 ax2.set_xlabel('Actual Returns')
 ax2.set_ylabel('Predicted Returns')
-
-N_VIEW = 100 
 
 # Graph 3: Train Forecast
 ax3 = fig.add_subplot(gs[1, 0])
