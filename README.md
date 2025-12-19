@@ -10,8 +10,8 @@ This project is optimized for the following high-performance system:
 
 ## 2. Requirements
 To ensure the NVIDIA RTX 5080 is utilized, install PyTorch with CUDA 12.x support first:
-# Python Version: 3.12.10
-# PyTorch with CUDA 12.4 support
+Python Version: 3.12.10
+PyTorch with CUDA 12.4 support
 --index-url https://download.pytorch.org/whl/cu124
 torch>=2.4.0
 torchvision>=0.19.0
