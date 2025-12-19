@@ -17,7 +17,7 @@ torch>=2.4.0
 torchvision>=0.19.0
 torchaudio>=2.4.0
 
-# Data Science & Finance Libraries
+Data Science & Finance Libraries:
 numpy>=1.24.0
 pandas>=2.0.0
 matplotlib>=3.7.0
